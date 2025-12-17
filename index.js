@@ -306,5 +306,16 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 });
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
 
 app.listen(PORT, () => console.log(`Bot running on :${PORT}`));
