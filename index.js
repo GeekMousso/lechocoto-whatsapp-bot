@@ -11,16 +11,18 @@ const {
   PHONE_NUMBER_ID,
 } = process.env;
 
+if (!VERIFY_TOKEN || !WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+  console.log("❌ Missing env vars:", {
+    VERIFY_TOKEN: !!VERIFY_TOKEN,
+    WHATSAPP_TOKEN: !!WHATSAPP_TOKEN,
+    PHONE_NUMBER_ID: !!PHONE_NUMBER_ID,
+  });
+}
+
 const WA_API = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
 
 // --- mini “DB” en mémoire (remplace par Redis en prod)
 const sessions = new Map();
-/*
-session = {
-  step: "MENU" | "PACK" | "SIZE" | "COLOR" | "DELIVERY" | "PAYMENT" | "CONFIRM",
-  pack, size, color, commune, address, payment
-}
-*/
 
 function getSession(from) {
   if (!sessions.has(from)) sessions.set(from, { step: "MENU" });
@@ -28,9 +30,20 @@ function getSession(from) {
 }
 
 async function sendMessage(payload) {
-  await axios.post(WA_API, payload, {
-    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
-  });
+  try {
+    const r = await axios.post(WA_API, payload, {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 10000,
+    });
+    return r.data;
+  } catch (e) {
+    // 🔥 Log clair de l’erreur d’envoi WhatsApp
+    console.error("❌ WhatsApp send error:", e?.response?.data || e.message);
+    throw e;
+  }
 }
 
 async function sendText(to, text) {
@@ -191,131 +204,126 @@ async function sendConfirm(to, s) {
   });
 }
 
-// --- Webhook verification (GET)
+// --- Webhook verification (GET) (UN SEUL)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
   return res.sendStatus(403);
 });
 
 // --- Webhook receiver (POST)
-app.post("/webhook", async (req, res) => {
-  try {
-    const entry = req.body?.entry?.[0];
-    const change = entry?.changes?.[0]?.value;
-    const msg = change?.messages?.[0];
+// IMPORTANT : on ACK tout de suite, puis on traite après
+app.post("/webhook", (req, res) => {
+  res.sendStatus(200);
 
-    if (!msg) return res.sendStatus(200);
+  (async () => {
+    try {
+      console.log("📩 Webhook reçu:", JSON.stringify(req.body, null, 2));
 
-    const from = msg.from; // numéro user
-    const s = getSession(from);
+      const entry = req.body?.entry?.[0];
+      const change = entry?.changes?.[0]?.value;
+      const msg = change?.messages?.[0];
 
-    // Helper: récupérer id de bouton/list
-    const interactive =
-      msg.type === "interactive" ? msg.interactive : null;
+      if (!msg) {
+        console.log("ℹ️ Pas de message (probablement un status update).");
+        return;
+      }
 
-    const replyId =
-      interactive?.button_reply?.id ||
-      interactive?.list_reply?.id ||
-      null;
+      const from = msg.from;
+      const s = getSession(from);
 
-    // 1) MENU actions
-    if (replyId === "CMD") {
-      s.step = "PACK";
-      await sendPackChoice(from);
-      return res.sendStatus(200);
-    }
-    if (replyId === "CAT") {
-      await sendText(from, "📸 Catalogue: Vert / Bleu marine / Noir / Gris.\nDis-moi: *Commander* pour choisir ton pack.");
+      const interactive = msg.type === "interactive" ? msg.interactive : null;
+      const replyId =
+        interactive?.button_reply?.id ||
+        interactive?.list_reply?.id ||
+        null;
+
+      console.log("✅ From:", from, "type:", msg.type, "replyId:", replyId);
+
+      // MENU
+      if (replyId === "CMD") {
+        s.step = "PACK";
+        await sendPackChoice(from);
+        return;
+      }
+      if (replyId === "CAT") {
+        await sendText(from, "📸 Catalogue: Vert / Bleu marine / Noir / Gris.\nDis-moi: *Commander* pour choisir ton pack.");
+        await sendMenu(from);
+        return;
+      }
+      if (replyId === "HUM") {
+        s.step = "MENU";
+        await sendText(from, "👤 Un agent te répond tout de suite. En attendant, tu peux écrire: taille + couleur + commune.");
+        return;
+      }
+
+      // PACK
+      if (replyId?.startsWith("PACK_")) {
+        s.pack = replyId.replace("PACK_", "Pack ");
+        s.step = "SIZE";
+        await sendSizeChoice(from);
+        return;
+      }
+
+      // SIZE
+      if (replyId?.startsWith("SIZE_")) {
+        s.size = replyId.replace("SIZE_", "");
+        s.step = "COLOR";
+        await sendColorChoice(from);
+        return;
+      }
+
+      // COLOR
+      if (replyId?.startsWith("COL_")) {
+        const map = { COL_VERT: "Vert", COL_BLEU: "Bleu marine", COL_NOIR: "Noir", COL_GRIS: "Gris" };
+        s.color = map[replyId] || "Couleur";
+        s.step = "DELIVERY";
+        await askDelivery(from);
+        return;
+      }
+
+      // DELIVERY texte libre
+      if (s.step === "DELIVERY" && msg.type === "text") {
+        const body = msg.text.body.trim();
+        const parts = body.split(",");
+        s.commune = (parts[0] || "").trim() || "Abidjan";
+        s.address = parts.slice(1).join(",").trim() || body;
+        s.step = "PAYMENT";
+        await sendPaymentChoice(from);
+        return;
+      }
+
+      // PAYMENT
+      if (replyId === "PAY_CASH" || replyId === "PAY_MOMO") {
+        s.payment = replyId === "PAY_CASH" ? "Cash" : "Mobile Money";
+        s.step = "CONFIRM";
+        await sendConfirm(from, s);
+        return;
+      }
+
+      // CONFIRM
+      if (replyId === "CONFIRM_YES") {
+        s.step = "MENU";
+        await sendText(from, "✅ Commande confirmée !\nMerci 🤝\nUn agent te contacte pour finaliser la livraison.");
+        return;
+      }
+      if (replyId === "CONFIRM_EDIT") {
+        s.step = "PACK";
+        await sendPackChoice(from);
+        return;
+      }
+
+      // Default: premier message texte
       await sendMenu(from);
-      return res.sendStatus(200);
+    } catch (e) {
+      console.error("❌ Processing error:", e?.response?.data || e.message || e);
     }
-    if (replyId === "HUM") {
-      s.step = "MENU";
-      await sendText(from, "👤 Un agent te répond tout de suite. En attendant, tu peux écrire: taille + couleur + commune.");
-      return res.sendStatus(200);
-    }
-
-    // 2) PACK
-    if (replyId?.startsWith("PACK_")) {
-      s.pack = replyId.replace("PACK_", "Pack ");
-      s.step = "SIZE";
-      await sendSizeChoice(from);
-      return res.sendStatus(200);
-    }
-
-    // 3) SIZE
-    if (replyId?.startsWith("SIZE_")) {
-      s.size = replyId.replace("SIZE_", "");
-      s.step = "COLOR";
-      await sendColorChoice(from);
-      return res.sendStatus(200);
-    }
-
-    // 4) COLOR
-    if (replyId?.startsWith("COL_")) {
-      const map = { COL_VERT: "Vert", COL_BLEU: "Bleu marine", COL_NOIR: "Noir", COL_GRIS: "Gris" };
-      s.color = map[replyId] || "Couleur";
-      s.step = "DELIVERY";
-      await askDelivery(from);
-      return res.sendStatus(200);
-    }
-
-    // 5) DELIVERY (texte libre)
-    if (s.step === "DELIVERY" && msg.type === "text") {
-      // simple parsing: avant la première virgule = commune
-      const body = msg.text.body.trim();
-      const parts = body.split(",");
-      s.commune = (parts[0] || "").trim() || "Abidjan";
-      s.address = parts.slice(1).join(",").trim() || body;
-      s.step = "PAYMENT";
-      await sendPaymentChoice(from);
-      return res.sendStatus(200);
-    }
-
-    // 6) PAYMENT
-    if (replyId === "PAY_CASH" || replyId === "PAY_MOMO") {
-      s.payment = replyId === "PAY_CASH" ? "Cash" : "Mobile Money";
-      s.step = "CONFIRM";
-      await sendConfirm(from, s);
-      return res.sendStatus(200);
-    }
-
-    // 7) CONFIRM
-    if (replyId === "CONFIRM_YES") {
-      s.step = "MENU";
-      await sendText(from, "✅ Commande confirmée !\nMerci 🤝\nUn agent te contacte pour finaliser la livraison.");
-      return res.sendStatus(200);
-    }
-    if (replyId === "CONFIRM_EDIT") {
-      // reset rapide: on recommence pack
-      s.step = "PACK";
-      await sendPackChoice(from);
-      return res.sendStatus(200);
-    }
-
-    // Default: si premier message texte
-    await sendMenu(from);
-    return res.sendStatus(200);
-
-  } catch (e) {
-    console.error(e);
-    return res.sendStatus(200);
-  }
-});
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-
-  return res.sendStatus(403);
+  })();
 });
 
-app.listen(PORT, () => console.log(`Bot running on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ Bot running on :${PORT}`));
